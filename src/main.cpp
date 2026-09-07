@@ -1,12 +1,26 @@
 // Author: James Balolong
-// Version 1.0
-// Smart Peg Board – ESP32 (NodeMCU-32S) scaffold
-// Sensor strategy: 2× CD74HC4067 (32 channels) + 4 direct GPIO (holes 33–36)
+// Version 1.0: Added main template, no libraries yet.
+// Version 2.0: Added libraries, basic game logic, and TFT display.
 
+
+// Dev note: Make sure to update the GPIO pins in the code and the hardware.
+// match it here: https://docs.google.com/spreadsheets/d/1w5ly4Z4cuHxgvfpRNchlJxbn6LrLd6HA32Z_nsnv98A/edit?gid=0#gid=0
+// This code needs testing pa.
+// do we use the same libraries? TFT_eSPI, ArduinoJson, HTTPClient, WiFi.h?
+
+// IMPORTANT: You guys can explore sa wokwi.com para sa mga testing.
+// Smart Peg Board – ESP32 (NodeMCU-32S) scaffold
+// Sensor detection: 2× CD74HC4067 (32 channels) + 4 direct GPIO (holes 33–36)
+// About sa 36 holes na detection, pinili ko yung paggamit ng 2x CD74HC4067 kasi sa kanya, pinapangalanan nya ang mga holes sa 1-33 then ung remaining holes ay 34-36 ay nasa GPIO pins.
+
+// Missing codes pa: yung pag send ng data sa wifi. You did not give me anything yet so it was left blank.
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <TFT_eSPI.h>
+#include <SPI.h>
+#include <cstdio>
 
 // ---------------------------------------------------------------------------
 // Compile-time sizes
@@ -23,7 +37,10 @@ static const uint8_t MUX_CHANNEL_COUNT = 16;
 // on the board if those GPIOs are needed for LEDs/buzzer instead.
 // ---------------------------------------------------------------------------
 
+// Guys, dito nyo nalang ichange yung mga GPIO pins. 
 // --- SPI TFT (ILI9341) ---
+// These constants document the wiring. TFT_eSPI actually uses
+// lib/TFT_eSPI-master/User_Setup.h — keep both in sync.
 const int PIN_TFT_SCK = 18;   // CHANGE GPIO HERE if pin assignments differ on hardware
 const int PIN_TFT_MOSI = 23;  // CHANGE GPIO HERE if pin assignments differ on hardware
 const int PIN_TFT_DC = 2;     // CHANGE GPIO HERE if pin assignments differ on hardware
@@ -75,6 +92,17 @@ const int PIN_LED_RED = 16;    // CHANGE GPIO HERE if pin assignments differ on 
 // --- Buzzer ---
 const int PIN_BUZZER = 1;  // CHANGE GPIO HERE if pin assignments differ on hardware
                            // Placeholder only: GPIO 1 is UART0 TX. Remap once a free pin exists on the PCB.
+static const int BUZZER_PWM_CHANNEL = 0;
+static const int BUZZER_PWM_RES_BITS = 8;
+
+// ---------------------------------------------------------------------------
+// TFT (ILI9341 320×240, pins come from TFT_eSPI User_Setup.h)
+// ---------------------------------------------------------------------------
+TFT_eSPI tft = TFT_eSPI();
+static const uint16_t COL_BG = 0x0A28;       // dark navy
+static const uint16_t COL_HEADER = 0x0294;   // teal header bar
+static const uint16_t COL_PANEL = 0x1248;    // slightly lighter panel
+static const uint8_t TFT_ROTATION = 1;       // landscape 320×240
 
 // ---------------------------------------------------------------------------
 // Timing / debounce
@@ -118,6 +146,12 @@ uint32_t debounceStartMs[GRID_SIZE][GRID_SIZE] = {};
 uint32_t levelStartMs = 0;
 uint32_t elapsedTimeMs[LEVEL_COUNT] = {};
 uint16_t errorCount[LEVEL_COUNT] = {};
+
+// Display dirty-tracking (avoid full-screen redraw every loop)
+int lastUiState = -1;
+uint8_t lastUiLevel = 255;
+uint32_t lastUiSeconds = 0xFFFFFFFF;
+uint16_t lastUiErrors = 0xFFFF;
 
 // Button ISR timestamps (press = falling edge, release handled in loop)
 volatile uint32_t greenPressMs = 0;
@@ -228,7 +262,17 @@ uint8_t targetAt(uint8_t level, uint8_t row, uint8_t col);
 void enterState(GameState next);
 void handleStateMachine();
 void updateLeds();
+void displayInit();
+void displayInvalidate();
 void displayUpdate();
+void formatMmSs(uint32_t ms, char *buf, size_t bufLen);
+void drawHeaderBar(const char *title);
+void drawIdleScreen();
+void drawLevelActiveScreen(bool fullRedraw);
+void drawLevelCompleteScreen();
+void drawGameCompleteScreen();
+void buzzerInit();
+void playNote(uint16_t freqHz, uint16_t durationMs, uint16_t gapMs = 25);
 void playToneSuccess();
 void playToneError();
 void playToneLevelComplete();
@@ -378,40 +422,262 @@ void handleSensorChange(uint8_t row, uint8_t col, bool inserted) {
     Serial.print(elapsedTimeMs[currentLevel]);
     Serial.print("  errors=");
     Serial.println(errorCount[currentLevel]);
-    playToneLevelComplete();
     enterState(LEVEL_COMPLETE);
+    playToneLevelComplete();
   }
 }
 
 // ---------------------------------------------------------------------------
-// Placeholder UI / audio / network
+// TFT UI (ILI9341 via TFT_eSPI)
 // ---------------------------------------------------------------------------
+void displayInit() {
+  tft.init();
+  tft.setRotation(TFT_ROTATION);
+  tft.fillScreen(COL_BG);
+  displayInvalidate();
+}
+
+void displayInvalidate() {
+  lastUiState = -1;
+  lastUiLevel = 255;
+  lastUiSeconds = 0xFFFFFFFF;
+  lastUiErrors = 0xFFFF;
+}
+
+void formatMmSs(uint32_t ms, char *buf, size_t bufLen) {
+  const uint32_t totalSec = ms / 1000UL;
+  const uint32_t mm = totalSec / 60UL;
+  const uint32_t ss = totalSec % 60UL;
+  snprintf(buf, bufLen, "%02lu:%02lu", static_cast<unsigned long>(mm), static_cast<unsigned long>(ss));
+}
+
+void drawHeaderBar(const char *title) {
+  tft.fillRect(0, 0, tft.width(), 44, COL_HEADER);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_WHITE, COL_HEADER);
+  tft.setTextFont(4);
+  tft.drawString(title, tft.width() / 2, 22);
+}
+
+void drawIdleScreen() {
+  tft.fillScreen(COL_BG);
+  drawHeaderBar("Smart Pegboard");
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_WHITE, COL_BG);
+  tft.setTextFont(4);
+  tft.drawString("Ready to play", tft.width() / 2, 100);
+
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_CYAN, COL_BG);
+  tft.drawString("Press GREEN to start", tft.width() / 2, 150);
+  tft.setTextColor(TFT_LIGHTGREY, COL_BG);
+  tft.drawString("10 levels  |  match the printed pattern", tft.width() / 2, 185);
+}
+
+void drawLevelActiveScreen(bool fullRedraw) {
+  const uint32_t elapsed = millis() - levelStartMs;
+  const uint32_t seconds = elapsed / 1000UL;
+  const uint16_t errors = errorCount[currentLevel];
+
+  if (fullRedraw) {
+    char title[24];
+    snprintf(title, sizeof(title), "Level %u", static_cast<unsigned>(currentLevel + 1));
+    tft.fillScreen(COL_BG);
+    drawHeaderBar(title);
+
+    tft.fillRoundRect(16, 62, tft.width() - 32, 118, 8, COL_PANEL);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(TFT_LIGHTGREY, COL_PANEL);
+    tft.setTextFont(2);
+    tft.drawString("Time", 32, 76);
+    tft.drawString("Errors", 32, 130);
+
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_YELLOW, COL_BG);
+    tft.setTextFont(2);
+    tft.drawString("Insert pegs!", tft.width() / 2, 210);
+  }
+
+  if (fullRedraw || seconds != lastUiSeconds) {
+    char timeBuf[12];
+    formatMmSs(elapsed, timeBuf, sizeof(timeBuf));
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(TFT_WHITE, COL_PANEL);
+    tft.setTextFont(6);
+    tft.fillRect(110, 68, 170, 48, COL_PANEL);
+    tft.drawString(timeBuf, 118, 72);
+    lastUiSeconds = seconds;
+  }
+
+  if (fullRedraw || errors != lastUiErrors) {
+    char errBuf[12];
+    snprintf(errBuf, sizeof(errBuf), "%u", static_cast<unsigned>(errors));
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(errors == 0 ? TFT_GREEN : TFT_ORANGE, COL_PANEL);
+    tft.setTextFont(4);
+    tft.fillRect(110, 124, 170, 32, COL_PANEL);
+    tft.drawString(errBuf, 118, 126);
+    lastUiErrors = errors;
+  }
+}
+
+void drawLevelCompleteScreen() {
+  char title[28];
+  snprintf(title, sizeof(title), "Level %u Complete!", static_cast<unsigned>(currentLevel + 1));
+
+  tft.fillScreen(COL_BG);
+  drawHeaderBar(title);
+
+  char timeBuf[12];
+  formatMmSs(elapsedTimeMs[currentLevel], timeBuf, sizeof(timeBuf));
+  char line[32];
+
+  tft.fillRoundRect(16, 64, tft.width() - 32, 110, 8, COL_PANEL);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(4);
+  tft.setTextColor(TFT_CYAN, COL_PANEL);
+  snprintf(line, sizeof(line), "Time: %s", timeBuf);
+  tft.drawString(line, tft.width() / 2, 96);
+  tft.setTextColor(TFT_ORANGE, COL_PANEL);
+  snprintf(line, sizeof(line), "Errors: %u", static_cast<unsigned>(errorCount[currentLevel]));
+  tft.drawString(line, tft.width() / 2, 136);
+
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_GREEN, COL_BG);
+  const char *hint = (currentLevel + 1 >= LEVEL_COUNT) ? "Press GREEN to finish" : "Press GREEN for next";
+  tft.drawString(hint, tft.width() / 2, 208);
+}
+
+void drawGameCompleteScreen() {
+  uint32_t totalMs = 0;
+  uint32_t totalErr = 0;
+  for (uint8_t i = 0; i < LEVEL_COUNT; i++) {
+    totalMs += elapsedTimeMs[i];
+    totalErr += errorCount[i];
+  }
+
+  char timeBuf[12];
+  formatMmSs(totalMs, timeBuf, sizeof(timeBuf));
+
+  tft.fillScreen(COL_BG);
+  drawHeaderBar("Congratulations!");
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(4);
+  tft.setTextColor(TFT_YELLOW, COL_BG);
+  char line[36];
+  snprintf(line, sizeof(line), "Total Time: %s", timeBuf);
+  tft.drawString(line, tft.width() / 2, 68);
+  tft.setTextColor(TFT_ORANGE, COL_BG);
+  snprintf(line, sizeof(line), "Total Errors: %lu", static_cast<unsigned long>(totalErr));
+  tft.drawString(line, tft.width() / 2, 102);
+
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_WHITE, COL_BG);
+  tft.setTextDatum(TL_DATUM);
+  for (uint8_t i = 0; i < LEVEL_COUNT; i++) {
+    formatMmSs(elapsedTimeMs[i], timeBuf, sizeof(timeBuf));
+    snprintf(line, sizeof(line), "L%u %s  e%u",
+             static_cast<unsigned>(i + 1),
+             timeBuf,
+             static_cast<unsigned>(errorCount[i]));
+    const int x = (i < 5) ? 16 : 170;
+    const int y = 128 + static_cast<int>((i % 5) * 16);
+    tft.drawString(line, x, y);
+  }
+}
+
 void displayUpdate() {
-  // TODO: drive ILI9341 (Adafruit_ILI9341) per currentState
-  // IDLE: wait-to-start
-  // LEVEL_ACTIVE: Level X, Time mm:ss, Errors N
-  // LEVEL_COMPLETE: results + “Press Green for next”
-  // GAME_COMPLETE: congratulations + totals
+  const int stateNow = static_cast<int>(currentState);
+  const bool stateChanged = (stateNow != lastUiState) || (currentLevel != lastUiLevel);
+
+  if (!stateChanged && currentState == LEVEL_ACTIVE) {
+    drawLevelActiveScreen(false);
+    return;
+  }
+
+  if (!stateChanged) {
+    return;
+  }
+
+  lastUiState = stateNow;
+  lastUiLevel = currentLevel;
+  lastUiSeconds = 0xFFFFFFFF;
+  lastUiErrors = 0xFFFF;
+
+  switch (currentState) {
+    case IDLE:
+      drawIdleScreen();
+      break;
+    case LEVEL_ACTIVE:
+      drawLevelActiveScreen(true);
+      break;
+    case LEVEL_COMPLETE:
+      drawLevelCompleteScreen();
+      break;
+    case GAME_COMPLETE:
+      drawGameCompleteScreen();
+      break;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Buzzer melodies (LEDC PWM — works with a passive buzzer; an active buzzer
+// will still click/buzz for the duration of each note)
+// ---------------------------------------------------------------------------
+void buzzerInit() {
+  ledcSetup(BUZZER_PWM_CHANNEL, 2000, BUZZER_PWM_RES_BITS);
+  ledcAttachPin(PIN_BUZZER, BUZZER_PWM_CHANNEL);
+  ledcWrite(BUZZER_PWM_CHANNEL, 0);
+}
+
+void playNote(uint16_t freqHz, uint16_t durationMs, uint16_t gapMs) {
+  if (freqHz == 0) {
+    ledcWrite(BUZZER_PWM_CHANNEL, 0);
+  } else {
+    ledcSetup(BUZZER_PWM_CHANNEL, freqHz, BUZZER_PWM_RES_BITS);
+    ledcAttachPin(PIN_BUZZER, BUZZER_PWM_CHANNEL);
+    ledcWrite(BUZZER_PWM_CHANNEL, 128);  // ~50% duty
+  }
+  delay(durationMs);
+  ledcWrite(BUZZER_PWM_CHANNEL, 0);
+  if (gapMs > 0) {
+    delay(gapMs);
+  }
 }
 
 void playToneSuccess() {
-  // TODO: short rising two-note success melody on PIN_BUZZER
+  // Two rising notes (C5 -> E5)
+  playNote(523, 90, 20);
+  playNote(659, 140, 15);
 }
 
 void playToneError() {
-  // TODO: low buzz ~200 Hz, 300 ms on PIN_BUZZER
+  playNote(200, 300, 10);
 }
 
 void playToneLevelComplete() {
-  // TODO: two-tone chime on PIN_BUZZER
+  // Two-tone chime (G5 -> C6)
+  playNote(784, 140, 30);
+  playNote(1047, 220, 15);
 }
 
 void playToneNeutral() {
-  // TODO: short beep on peg removal (not success/error)
+  playNote(880, 50, 10);
 }
 
 void playToneVictory() {
-  // TODO: game-complete melody
+  // Compact Final Fantasy victory fanfare (opening phrase)
+  playNote(523, 90, 15);   // C5
+  playNote(523, 90, 15);
+  playNote(523, 90, 15);
+  playNote(523, 280, 40);
+  playNote(415, 240, 30);  // G#4
+  playNote(466, 240, 30);  // A#4
+  playNote(523, 160, 20);  // C5
+  playNote(466, 90, 15);   // A#4
+  playNote(523, 420, 20);  // C5
 }
 
 void uploadResults() {
@@ -473,11 +739,16 @@ void startLevel(uint8_t levelIndex) {
   errorCount[currentLevel] = 0;
   elapsedTimeMs[currentLevel] = 0;
   levelStartMs = millis();
+  displayInvalidate();
 
   Serial.print("[LEVEL] starting ");
   Serial.println(currentLevel + 1);
 
-  enterState(LEVEL_ACTIVE);
+  if (currentState == LEVEL_ACTIVE) {
+    displayUpdate();
+  } else {
+    enterState(LEVEL_ACTIVE);
+  }
 }
 
 void handleStateMachine() {
@@ -608,10 +879,15 @@ void setup() {
   setMuxEnabled(PIN_MUX2_EN, false);
   digitalWrite(PIN_BUZZER, LOW);
 
+  buzzerInit();
+  displayInit();
+
   attachInterrupt(digitalPinToInterrupt(PIN_BTN_GREEN), onGreenButtonFalling, FALLING);
   attachInterrupt(digitalPinToInterrupt(PIN_BTN_RED), onRedButtonFalling, FALLING);
 
-  enterState(IDLE);
+  displayInvalidate();
+  displayUpdate();
+  updateLeds();
   Serial.println("[STATE] entering IDLE");
 }
 
